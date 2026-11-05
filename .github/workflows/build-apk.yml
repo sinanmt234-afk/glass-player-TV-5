@@ -1,0 +1,125 @@
+name: Build TV APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        run: |
+          mkdir -p lib
+          cp pubspec.yaml /tmp/pubspec.yaml
+          cp lib/main.dart /tmp/main.dart
+          flutter create --platforms=android --org com.aetherial --project-name glass_player_tv .
+          cp /tmp/pubspec.yaml pubspec.yaml
+          cp /tmp/main.dart lib/main.dart
+
+      - name: Patch Android project for TV
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re, zlib, struct
+
+          root = pathlib.Path('.')
+
+          # ---------- AndroidManifest ----------
+          mp = root / 'android/app/src/main/AndroidManifest.xml'
+          s = mp.read_text()
+
+          perms = '''    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+              <uses-feature android:name="android.software.leanback" android:required="false"/>
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+          '''
+
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Glass Player TV"', s, count=1)
+          s = s.replace('<application', perms + '    <application android:banner="@drawable/banner" android:usesCleartextTraffic="true"', 1)
+          s = s.replace('<activity', '<activity android:screenOrientation="sensorLandscape"', 1)
+          # Skia renderer is the most compatible/lightest on old TV GPUs
+          s = s.replace('</application>', '    <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="false"/>\n    </application>', 1)
+
+          launcher = '<category android:name="android.intent.category.LAUNCHER"/>'
+          assert launcher in s, 'LAUNCHER category not found in manifest'
+          s = s.replace(launcher, launcher + '\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>', 1)
+          mp.write_text(s)
+
+          # ---------- minSdk (older TV boxes are Android 5/6) ----------
+          for g in (root / 'android/app').glob('build.gradle*'):
+              g.write_text(g.read_text().replace('flutter.minSdkVersion', '21'))
+
+          # ---------- TV banner (320x180 PNG, drawn in pure python) ----------
+          W, H = 320, 180
+
+          def clamp(v):
+              return max(0, min(255, int(v)))
+
+          def inside_tri(px, py, a, b, c):
+              def sign(p1, p2, p3):
+                  return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+              d1 = sign((px, py), a, b)
+              d2 = sign((px, py), b, c)
+              d3 = sign((px, py), c, a)
+              neg = d1 < 0 or d2 < 0 or d3 < 0
+              pos = d1 > 0 or d2 > 0 or d3 > 0
+              return not (neg and pos)
+
+          def pixel(x, y):
+              t = (x / W + y / H) / 2
+              r, g, b = 11 + 60 * t, 16 + 30 * t, 32 + 110 * t
+              d = ((x - 250) ** 2 + (y - 40) ** 2) ** 0.5
+              if d < 90:
+                  k = (1 - d / 90) * 0.5
+                  r, g, b = r + 120 * k, g + 40 * k, b + 160 * k
+              d = ((x - 60) ** 2 + (y - 150) ** 2) ** 0.5
+              if d < 100:
+                  k = (1 - d / 100) * 0.5
+                  r, g, b = r + 0 * k, g + 150 * k, b + 190 * k
+              if 70 <= x <= 250 and 35 <= y <= 145:
+                  r, g, b = r + 38, g + 38, b + 38
+                  if x in (70, 250) or y in (35, 145):
+                      r, g, b = 200, 210, 235
+              if inside_tri(x, y, (140, 65), (140, 115), (190, 90)):
+                  r, g, b = 255, 255, 255
+              return clamp(r), clamp(g), clamp(b)
+
+          def png(w, h, px):
+              raw = b''.join(b'\x00' + b''.join(bytes(px(x, y)) for x in range(w)) for y in range(h))
+              def chunk(t, d):
+                  c = struct.pack('>I', len(d)) + t + d
+                  return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+              return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                      + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+          d = root / 'android/app/src/main/res/drawable'
+          d.mkdir(parents=True, exist_ok=True)
+          (d / 'banner.png').write_bytes(png(W, H, pixel))
+          print('TV patch done')
+          PYEOF
+
+      - name: Build release APK
+        run: |
+          flutter pub get
+          flutter build apk --release --no-shrink
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GlassPlayerTV-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
