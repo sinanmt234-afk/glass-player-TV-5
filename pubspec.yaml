@@ -1,0 +1,19 @@
+name: glass_player_tv
+description: Liquid glass video, audio and live TV player for Android TV
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.3.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+  media_kit_libs_video: ^1.0.5
+  photo_manager: ^3.6.0
+  shared_preferences: ^2.3.2
+
+flutter:
+  uses-material-design: true
